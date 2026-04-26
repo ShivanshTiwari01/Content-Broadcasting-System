@@ -1,0 +1,92 @@
+// Content Broadcasting System – Prisma Schema
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  PRINCIPAL
+  TEACHER
+}
+
+enum ContentStatus {
+  UPLOADED
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  role         Role     @default(TEACHER)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  // Relations
+  uploadedContent Content[] @relation("UploadedBy")
+  approvedContent Content[] @relation("ApprovedBy")
+
+  @@map("users")
+}
+
+model Content {
+  id              String        @id @default(uuid())
+  title           String
+  description     String?
+  subject         String
+  fileUrl         String        @map("file_url")
+  fileType        String        @map("file_type")
+  fileSize        Int           @map("file_size")
+  status          ContentStatus @default(UPLOADED)
+  rejectionReason String?       @map("rejection_reason")
+  approvedAt      DateTime?     @map("approved_at")
+  createdAt       DateTime      @default(now()) @map("created_at")
+
+  // Foreign keys
+  uploadedById String  @map("uploaded_by")
+  approvedById String? @map("approved_by")
+
+  // Relations
+  uploadedBy User  @relation("UploadedBy", fields: [uploadedById], references: [id])
+  approvedBy User? @relation("ApprovedBy", fields: [approvedById], references: [id])
+
+  schedules ContentSchedule[]
+
+  @@map("content")
+}
+
+model ContentSlot {
+  id        String   @id @default(uuid())
+  subject   String   @unique
+  createdAt DateTime @default(now()) @map("created_at")
+
+  schedules ContentSchedule[]
+
+  @@map("content_slots")
+}
+
+model ContentSchedule {
+  id            String   @id @default(uuid())
+  rotationOrder Int      @map("rotation_order")
+  duration      Int      @default(5) // minutes per slot
+  startTime     DateTime @map("start_time")
+  endTime       DateTime @map("end_time")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  // Foreign keys
+  contentId String @map("content_id")
+  slotId    String @map("slot_id")
+
+  // Relations
+  content Content     @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  slot    ContentSlot @relation(fields: [slotId], references: [id], onDelete: Cascade)
+
+  @@map("content_schedules")
+}

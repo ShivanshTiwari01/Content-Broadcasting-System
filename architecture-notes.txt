@@ -1,0 +1,140 @@
+Content Broadcasting System – Architecture Notes
+================================================
+
+1. AUTHENTICATION & RBAC FLOW
+-------------------------------
+- JWT-based authentication using the `jsonwebtoken` library.
+- On login/register, the server signs a JWT payload of { userId, role } with a secret
+  stored in the JWT_SECRET env var (HS256 algorithm).
+- Token expiry: configurable via JWT_EXPIRES_IN (default: 7d).
+- The `authenticate` middleware (middlewares/auth.middleware.ts) extracts the Bearer
+  token from the Authorization header, verifies it, and attaches the decoded payload
+  to `req.user`.
+- The `requireRole(...roles)` middleware factory (middlewares/role.middleware.ts)
+  enforces RBAC by checking `req.user.role` against the allowed roles.
+- Protected routes always use: authenticate → requireRole(...) → handler.
+- Two roles: PRINCIPAL and TEACHER. Role is stored in the users table and embedded
+  in the JWT so no extra DB lookup is needed per request.
+
+2. SUBJECT-BASED SYSTEM DESIGN
+--------------------------------
+- Each unique subject string maps to a single ContentSlot record.
+- ContentSlots are upserted on content upload, ensuring one slot per subject.
+- ContentSchedule joins Content to its ContentSlot with rotation_order and duration.
+- This design allows a subject's content to be independently rotated from other subjects.
+- The broadcast API groups content by subject and resolves active content per group.
+
+3. UPLOAD HANDLING APPROACH
+-----------------------------
+- Multer (disk storage) handles multipart/form-data file uploads.
+- Allowed types: JPG, PNG, GIF (checked via both MIME type and file extension).
+- Max file size: 10MB (configurable via MAX_FILE_SIZE_MB env var).
+- Files are stored in the local `uploads/` directory with a unique timestamped filename
+  to prevent collisions.
+- The file path is saved in content.file_url as `/uploads/<filename>`.
+- Files are served statically at GET /uploads/<filename>.
+- On content deletion, the physical file is also removed from disk.
+- S3 integration was excluded per project requirements (can be added later by swapping
+  the multer storage engine for multer-s3).
+
+4. APPROVAL WORKFLOW DESIGN
+-----------------------------
+- Content lifecycle: UPLOADED → PENDING → APPROVED | REJECTED
+- On upload, content status is immediately set to PENDING.
+- Only a user with role=PRINCIPAL can call PATCH /approval/:id/approve or /reject.
+- Rejection requires a rejectionReason field (min 5 characters).
+- Status transitions are validated: only PENDING content can be approved/rejected.
+- On approval, the content's approvedById and approvedAt are recorded.
+- On approval, the Redis cache keys for that teacher's live content are invalidated
+  so students immediately see the newly approved content.
+
+5. SCHEDULING / ROTATION LOGIC (VERY IMPORTANT)
+-------------------------------------------------
+Time-based Modulo Algorithm — no cron jobs required.
+
+Given a teacher's approved content for a subject:
+  a. Filter to items whose time window (start_time ≤ now ≤ end_time) includes the
+     current moment. This enforces the teacher-defined schedule.
+  b. Sort the filtered items by rotation_order ascending.
+  c. Compute totalCycleMs = sum of (duration_minutes × 60 × 1000) for all items.
+  d. elapsed = (Date.now()) % totalCycleMs
+     This gives us our position within the current cycle, anchored to Unix epoch 0.
+     This means the rotation is globally consistent — all students calling the API
+     at the same timestamp will see the same content.
+  e. Walk through the sorted list, subtracting each item's duration from `elapsed`.
+     The first item where elapsed < itemDuration is the currently active item.
+
+This is O(n) per subject group at query time, with no background processes.
+The result is cached in Redis for 30 seconds to reduce DB load.
+
+Edge cases handled:
+  - No approved content → return { message: "No content available" }
+  - Content approved but outside time window → filtered out, empty response
+  - Invalid teacherId → empty response (not 404 error, per spec)
+  - Invalid subject query param → empty response (not error, per spec)
+
+6. DATABASE DESIGN DECISIONS
+------------------------------
+Tables:
+  users           – Stores both PRINCIPAL and TEACHER users (role enum differentiates).
+  content         – All uploaded content with full lifecycle tracking.
+  content_slots   – One record per unique subject. Acts as the rotation container.
+  content_schedules – Joins content to its slot with rotation_order and time window.
+
+Key decisions:
+  - UUIDs as primary keys for all tables (future-proof, avoids sequential ID enumeration).
+  - content_slots.subject has a UNIQUE constraint to enforce one slot per subject.
+  - ContentSchedule.onDelete = Cascade so schedules are cleaned up with content.
+  - Columns use snake_case in DB (via @map) but camelCase in application code.
+  - password_hash is never selected in queries; only passwordHash is stored.
+  - approvedById is nullable to distinguish un-reviewed from reviewed content.
+
+7. FOLDER STRUCTURE
+---------------------
+src/
+├── config/env.ts          – Validated env vars (throws on missing required vars)
+├── lib/prisma.ts          – Prisma singleton (prevents connection pool exhaustion in dev)
+├── lib/redis.ts           – ioredis singleton with graceful degradation
+├── middlewares/
+│   ├── auth.middleware.ts  – JWT extraction and verification
+│   ├── role.middleware.ts  – RBAC role checks
+│   ├── upload.middleware.ts – Multer config (type/size validation)
+│   └── error.middleware.ts – Global error handler + 404 handler
+├── modules/               – Feature modules (each has schema/service/controller/routes)
+│   ├── auth/
+│   ├── user/
+│   ├── content/
+│   ├── approval/
+│   └── broadcast/         – Public live API + scheduling logic
+└── utils/
+    ├── response.ts         – Standardised API response shape helpers
+    ├── jwt.ts              – Token sign/verify wrappers
+    └── asyncHandler.ts     – Wraps async route handlers for error forwarding
+
+8. MIDDLEWARE USAGE
+--------------------
+- authenticate    → on all private routes (verifies JWT)
+- requireRole     → on role-specific routes (RBAC enforcement)
+- upload          → only on POST /content/upload (multipart parsing)
+- errorHandler    → mounted last in app.ts (catches all thrown errors)
+- notFoundHandler → mounted second-to-last (catches unmatched routes)
+- rateLimit       → on /content/live/* (protects public API from abuse)
+
+9. SCALABILITY APPROACH
+-------------------------
+Current implementation supports:
+  - Redis caching on /content/live with 30s TTL (reduces DB queries significantly
+    under high student load)
+  - Cache invalidation on approval so updates propagate within 30 seconds
+  - Prisma connection pooling managed automatically
+  - Stateless JWT authentication (horizontally scalable — no server-side session)
+  - Graceful shutdown for zero-downtime deploys
+
+Future extensions for high scale:
+  - Increase Redis TTL and use event-driven cache invalidation (Redis pub/sub)
+  - Add a message queue (BullMQ/RabbitMQ) for async approval notifications to teachers
+  - Move file storage to S3/GCS and serve from CDN
+  - Add pagination to all list endpoints (already filtered, easy to add)
+  - Add database read replicas for broadcast queries
+  - Use a connection pooler (PgBouncer) in front of PostgreSQL
+  - Add request-level tracing (OpenTelemetry) for observability
